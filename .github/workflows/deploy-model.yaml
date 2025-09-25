@@ -1,0 +1,161 @@
+name: deploy-model
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_type:
+        description: "Template in deploy/ to render"
+        type: choice
+        options:
+          - agg
+          - agg_router
+          - disagg
+          - disagg_router
+          - disagg_planner
+        default: disagg
+        required: true
+      main_container_image:
+        description: "Main container image for all components"
+        default: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.5.0
+        required: true
+      model_name:
+        description: "Model identifier passed to dynamo.vllm"
+        default: Qwen/Qwen3-0.6B
+        required: true
+      frontend_replicas:
+        description: "Replica count for Frontend"
+        type: number
+        default: 1
+        required: true
+      decode_replicas:
+        description: "Replica count for VllmDecodeWorker"
+        type: number
+        default: 1
+        required: true
+      prefill_replicas:
+        description: "Replica count for VllmPrefillWorker"
+        type: number
+        default: 1
+        required: true
+      planner_replicas:
+        description: "Replica count for Planner"
+        type: number
+        default: 1
+        required: true
+      prometheus_replicas:
+        description: "Replica count for Prometheus"
+        type: number
+        default: 1
+        required: true
+
+permissions: read-all
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.deployment_type || 'manual' }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Render manifest from template
+        id: render
+        env:
+          DEPLOYMENT_TYPE: ${{ github.event.inputs.deployment_type }}
+          MAIN_CONTAINER_IMAGE: ${{ github.event.inputs.main_container_image }}
+          MODEL: ${{ github.event.inputs.model_name }}
+          FRONTEND_REPLICAS: ${{ github.event.inputs.frontend_replicas }}
+          DECODE_REPLICAS: ${{ github.event.inputs.decode_replicas }}
+          PREFILL_REPLICAS: ${{ github.event.inputs.prefill_replicas }}
+          PLANNER_REPLICAS: ${{ github.event.inputs.planner_replicas }}
+          PROMETHEUS_REPLICAS: ${{ github.event.inputs.prometheus_replicas }}
+        run: |
+          set -euo pipefail
+          TEMPLATE="deploy/${DEPLOYMENT_TYPE}.yaml"
+          if [ ! -f "$TEMPLATE" ]; then
+            echo "Unsupported deployment type: ${DEPLOYMENT_TYPE}" >&2
+            echo "Available templates:"
+            ls deploy
+            exit 1
+          fi
+
+          mkdir -p rendered
+          MANIFEST="rendered/${DEPLOYMENT_TYPE}.yaml"
+          envsubst < "$TEMPLATE" > "$MANIFEST"
+          echo "manifest_path=$MANIFEST" >> "$GITHUB_OUTPUT"
+
+      - name: Override replica counts
+        env:
+          MANIFEST: ${{ steps.render.outputs.manifest_path }}
+          FRONTEND_REPLICAS: ${{ github.event.inputs.frontend_replicas }}
+          DECODE_REPLICAS: ${{ github.event.inputs.decode_replicas }}
+          PREFILL_REPLICAS: ${{ github.event.inputs.prefill_replicas }}
+          PLANNER_REPLICAS: ${{ github.event.inputs.planner_replicas }}
+          PROMETHEUS_REPLICAS: ${{ github.event.inputs.prometheus_replicas }}
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["MANIFEST"])
+          lines = path.read_text(encoding="utf-8").splitlines()
+
+          mapping = {
+              "Frontend": "FRONTEND_REPLICAS",
+              "VllmDecodeWorker": "DECODE_REPLICAS",
+              "VllmPrefillWorker": "PREFILL_REPLICAS",
+              "Planner": "PLANNER_REPLICAS",
+              "Prometheus": "PROMETHEUS_REPLICAS",
+          }
+
+          current_service = None
+          for idx, line in enumerate(lines):
+              stripped = line.strip()
+              indent = len(line) - len(line.lstrip(" "))
+
+              if stripped.endswith(":") and indent == 4:
+                  service_name = stripped[:-1]
+                  current_service = service_name if service_name in mapping else None
+                  continue
+
+              if current_service and stripped.startswith("replicas:"):
+                  env_key = mapping[current_service]
+                  raw_value = os.getenv(env_key, "").strip()
+                  if raw_value:
+                      try:
+                          replicas = int(raw_value)
+                      except ValueError as exc:
+                          raise SystemExit(
+                              f"Invalid integer for {env_key}: {raw_value}"
+                          ) from exc
+
+                      comment = ""
+                      if "#" in line:
+                          hash_index = line.index("#")
+                          comment = " " + line[hash_index:].rstrip()
+                          prefix = line[:hash_index]
+                      else:
+                          prefix = line
+
+                      prefix = prefix.split("replicas:")[0]
+                      lines[idx] = f"{prefix}replicas: {replicas}{comment}".rstrip()
+                  current_service = None
+
+          path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          print(path.read_text(encoding="utf-8"), end="")
+
+      - name: Deploy to cluster
+        run: |
+          set -euo pipefail
+          kubectl apply -f "${{ steps.render.outputs.manifest_path }}"
+
+      - name: Upload manifest artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rendered-manifest
+          path: ${{ steps.render.outputs.manifest_path }}

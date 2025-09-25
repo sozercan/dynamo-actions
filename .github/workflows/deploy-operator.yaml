@@ -1,0 +1,65 @@
+name: deploy-operator
+
+on:
+  workflow_dispatch:
+    inputs:
+      dynamo_version:
+        description: "Specific dynamo release tag (e.g. v0.5.0). Leave blank to use latest."
+        required: false
+
+permissions: read-all
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.dynamo_version || 'latest' }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    timeout-minutes: 60
+    steps:
+      - name: Verify kubectl, helm, and docker
+        run: |
+          set -euo pipefail
+          for bin in kubectl helm docker; do
+            if ! command -v "$bin" >/dev/null 2>&1; then
+              echo "::error::Required tool '$bin' not found in PATH" >&2
+              exit 1
+            fi
+          done
+          kubectl version --client
+          helm version
+          docker version
+      - run: nvidia-smi
+      - name: Resolve dynamo version
+        env:
+          INPUT_DYNAMO_VERSION: ${{ github.event.inputs.dynamo_version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_DYNAMO_VERSION}" ]; then
+            DYNAMO_VERSION="${INPUT_DYNAMO_VERSION}"
+            echo "Using provided dynamo version: ${DYNAMO_VERSION}"
+          else
+            DYNAMO_VERSION=$(curl -s https://api.github.com/repos/ai-dynamo/dynamo/releases/latest | jq -r .tag_name)
+            echo "Fetched latest dynamo version: ${DYNAMO_VERSION}"
+          fi
+          echo "DYNAMO_VERSION=${DYNAMO_VERSION}" >> "$GITHUB_ENV"
+      - name: Deploy Dynamo operator and platform
+        shell: bash
+        run: |
+          export NAMESPACE=dynamo-kubernetes
+          export RELEASE_VERSION=${DYNAMO_VERSION}
+
+          helm fetch https://helm.ngc.nvidia.com/nvidia/ai-dynamo/charts/dynamo-crds-${RELEASE_VERSION}.tgz
+          helm install dynamo-crds dynamo-crds-${RELEASE_VERSION}.tgz --namespace default
+
+          kubectl create namespace ${NAMESPACE}
+          helm fetch https://helm.ngc.nvidia.com/nvidia/ai-dynamo/charts/dynamo-platform-${RELEASE_VERSION}.tgz
+          helm install dynamo-platform dynamo-platform-${RELEASE_VERSION}.tgz --namespace ${NAMESPACE}
+      - name: Create HF token secret
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          kubectl create secret generic hf-token-secret \
+            --from-literal=HF_TOKEN=${HF_TOKEN} \
+            -n ${NAMESPACE}
