@@ -88,7 +88,7 @@ jobs:
       - name: Deploy Dynamo operator and platform
         shell: bash
         run: |
-          NAMESPACE=dynamo-kubernetes
+          NAMESPACE=dynamo-cloud
           RELEASE_VERSION="${RELEASE_VERSION:-${DYNAMO_VERSION#v}}"
           echo "NAMESPACE=${NAMESPACE}" >> "$GITHUB_ENV"
           export NAMESPACE RELEASE_VERSION

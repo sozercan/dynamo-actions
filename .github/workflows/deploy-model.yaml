@@ -65,6 +65,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.runtime || 'vllm' }}-${{ github.event.inputs.deployment_type || 'manual' }}
   cancel-in-progress: true
 
+env:
+  NAMESPACE: dynamo-cloud
+
 jobs:
   deploy:
     runs-on: self-hosted
@@ -313,12 +316,12 @@ jobs:
       - name: Deploy to cluster
         run: |
           set -euo pipefail
-          kubectl apply -f "${{ steps.render.outputs.manifest_path }}"
+          kubectl apply -f "${{ steps.render.outputs.manifest_path }}" -n ${NAMESPACE}
 
       - name: Validate deployment
         run: |
           set -euo pipefail
-          kubectl get -f "${{ steps.render.outputs.manifest_path }}" -o name
+          kubectl get -f "${{ steps.render.outputs.manifest_path }}" -o name -n ${NAMESPACE}
 
       - name: Upload manifest artifact
         if: always()
