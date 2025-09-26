@@ -173,6 +173,46 @@ gh workflow run deploy-model.yaml \
 
 ---
 
+## Simple Qwen (vLLM, Aggregate) Example
+
+Minimal aggregate deployment using the vLLM `agg` template (single frontend + single decode + single prefill worker) and the Qwen 0.6B model.
+
+| Input                | Value                             |
+| -------------------- | --------------------------------- |
+| runtime              | `vllm`                            |
+| deployment_type      | `agg`                             |
+| main_container_image | `my-registry/vllm-runtime:latest` |
+| model_name           | `Qwen/Qwen3-0.6B`                 |
+| frontend_replicas    | `1`                               |
+| decode_replicas      | `1`                               |
+| prefill_replicas     | `1`                               |
+| planner_replicas     | `1` (unused; required input)      |
+| prometheus_replicas  | `1` (unused; required input)      |
+
+### Prefilled Dispatch URL (Qwen vLLM Aggregate)
+
+```text
+https://github.com/sozercan/dynamo-actions/actions/workflows/deploy-model.yaml/dispatches/new?ref=main&inputs[runtime]=vllm&inputs[deployment_type]=agg&inputs[main_container_image]=my-registry/vllm-runtime:latest&inputs[model_name]=Qwen/Qwen3-0.6B&inputs[frontend_replicas]=1&inputs[decode_replicas]=1&inputs[prefill_replicas]=1&inputs[planner_replicas]=1&inputs[prometheus_replicas]=1
+```
+
+### GitHub CLI Invocation (Qwen vLLM Aggregate)
+
+```bash
+gh workflow run deploy-model.yaml \
+  --ref main \
+  -f runtime=vllm \
+  -f deployment_type=agg \
+  -f main_container_image=my-registry/vllm-runtime:latest \
+  -f model_name=Qwen/Qwen3-0.6B \
+  -f frontend_replicas=1 \
+  -f decode_replicas=1 \
+  -f prefill_replicas=1 \
+  -f planner_replicas=1 \
+  -f prometheus_replicas=1
+```
+
+---
+
 ## DeepSeek (SGLang, Disaggregated) Example
 
 Below is a reference configuration approximating the DeepSeek R1 disaggregated setup (single pod per role with 8 GPUs each, 8-way TP/DP/EP). Adjust the image to your built SGLang runtime.
