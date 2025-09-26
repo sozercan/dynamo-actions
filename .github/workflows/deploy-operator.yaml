@@ -113,8 +113,9 @@ jobs:
           NAMESPACE: ${{ env.NAMESPACE }}
         run: |
           set -euo pipefail
-          if [ -z "${HF_TOKEN:-}" ]; then
-            echo "::warning::HF_TOKEN secret not provided; skipping secret creation"
+          HF_TOKEN=$(echo '${{ secrets.HF_TOKEN }}')
+          if [ -z "${HF_TOKEN}" ] || [ "${HF_TOKEN}" = "" ]; then
+            echo "::warning::Repository secret HF_TOKEN not set; skipping secret creation"
             exit 0
           fi
           kubectl create secret generic hf-token-secret \
