@@ -6,6 +6,11 @@ on:
       dynamo_version:
         description: "Specific dynamo release tag (e.g. v0.5.0). Leave blank to use latest."
         required: false
+      skip_gpu_check:
+        description: "Skip GPU validation pod (set true for CPU-only clusters)."
+        type: boolean
+        default: false
+        required: false
 
 permissions: read-all
 
@@ -33,6 +38,7 @@ jobs:
           helm version
           docker version
       - name: Validate cluster NVIDIA GPUs
+        if: ${{ github.event.inputs.skip_gpu_check != 'true' }}
         run: |
           set -euo pipefail
           echo "Checking for GPU-capable nodes (allocatable nvidia.com/gpu > 0)..."
@@ -72,6 +78,9 @@ jobs:
           echo "Cleaning up validation pod..."
           kubectl delete pod ${POD_NAME} --wait=true
           echo "Cluster GPU validation succeeded."
+      - name: Skip note (no GPU validation run)
+        if: ${{ github.event.inputs.skip_gpu_check == 'true' }}
+        run: echo "Skipping GPU validation step as requested (skip_gpu_check=true)."
       - name: Resolve dynamo version
         env:
           INPUT_DYNAMO_VERSION: ${{ github.event.inputs.dynamo_version }}
