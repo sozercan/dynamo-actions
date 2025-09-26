@@ -7,7 +7,7 @@ GitHub Actions workflows for building container images and deploying [NVIDIA Dyn
 | Workflow          | Purpose                                                                                                              | Trigger             | Key inputs                                                              | Outputs                               |
 | ----------------- | -------------------------------------------------------------------------------------------------------------------- | ------------------- | ----------------------------------------------------------------------- | ------------------------------------- |
 | `build-vllm`      | Build the VLLM container via the Dynamo repository and push to NGC.                                                  | `workflow_dispatch` | `dynamo_ref` (optional)                                                 | Image pushed to `nvcr.io`.            |
-| `deploy-model`    | Render a deployment template under `deploy/`, substitute env variables, override replicas, and apply with `kubectl`. | `workflow_dispatch` | `deployment_type`, `main_container_image`, `model_name`, replica counts | Applied manifest + uploaded artifact. |
+| `deploy-model`    | Render a deployment template under `deploy/`, substitute env variables, override replicas, and apply with `kubectl`. | `workflow_dispatch` | `runtime`, `deployment_type`, `main_container_image`, `model_name`, JSON config inputs | Applied manifest + uploaded artifact. |
 | `deploy-operator` | Install / upgrade the Dynamo platform (CRDs + operator) via Helm.                                                    | `workflow_dispatch` | `dynamo_version` (optional)                                             | Operator installed in target cluster. |
 
 ---
@@ -28,20 +28,44 @@ Builds and optionally publishes a container using Dynamo's `./container/build.sh
 
 ### `deploy-model`
 
-Applies one of the templates under `deploy/` to a Kubernetes cluster with your chosen image, model, and replica counts.
+Applies one of the templates under `deploy/` to a Kubernetes cluster with your chosen runtime, image, model, and configuration. The workflow now uses **compact JSON inputs** (to stay within GitHub's 10 input limit) that are parsed into environment variables before rendering.
 
 Key capabilities:
 
-- `envsubst` replaces `MAIN_CONTAINER_IMAGE`, `MODEL`, and replica placeholders in the selected template.
+- `envsubst` replaces `MAIN_CONTAINER_IMAGE`, `MODEL`, replica placeholders and SGLang-specific values.
 - A Python post-processing step coerces replica counts to integers to satisfy the CRD schema.
 - The rendered manifest is saved as an artifact for later inspection / rollback.
 
 #### Inputs (deploy-model)
 
-- `deployment_type` – Template name (`agg`, `agg_router`, `disagg`, `disagg_router`, `disagg_planner`).
-- `main_container_image` – Image to use for all `mainContainer` entries.
-- `model_name` – Propagated to `python3 -m dynamo.vllm` calls in the template.
-- `frontend_replicas`, `decode_replicas`, `prefill_replicas`, `planner_replicas`, `prometheus_replicas` – Integer replica overrides when the service exists in the chosen YAML.
+Required:
+
+- `runtime` – `vllm` or `sglang`.
+- `deployment_type` – Template filename (without `.yaml`) under `deploy/<runtime>/`.
+- `main_container_image` – Image used for all `mainContainer` entries.
+- `model_name` – Model identifier passed to the runtime entrypoint.
+
+JSON configuration inputs (all optional; each has defaults if omitted):
+
+| Input name       | Applies to | JSON Keys (examples)                                                                                                                       | Purpose                            |
+| ---------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------- |
+| `replicas`       | both       | `frontend`, `decode`, `prefill`, `planner`, `prometheus`                                                                                   | Override service replica counts.   |
+| `sglang_scaling` | sglang     | `page_size`, `tp_size`, `dp_size`, `ep_size`, `decode_gpus`, `prefill_gpus`, `multinode_decode_node_count`, `multinode_prefill_node_count` | Parallelism & GPU sizing.          |
+| `sglang_flags`   | sglang     | `enable_dp_attention`, `trust_remote_code`, `skip_tokenizer_init`, `mem_fraction_static`                                                   | Boolean / misc tuning flags.       |
+| `sglang_disagg`  | sglang     | `disagg_transfer_backend`, `disagg_bootstrap_port`                                                                                         | Disaggregation transport settings. |
+| `command_extras` | sglang     | `worker`, `frontend`, `planner`, `prometheus`                                                                                              | Append extra CLI flags per role.   |
+
+##### Defaults
+
+```jsonc
+replicas:        { "frontend":1, "decode":1, "prefill":1, "planner":1, "prometheus":1 }
+sglang_scaling:  { "page_size":16, "tp_size":1, "dp_size":1, "ep_size":1, "decode_gpus":1, "prefill_gpus":1, "multinode_decode_node_count":1, "multinode_prefill_node_count":1 }
+sglang_flags:    { "enable_dp_attention":false, "trust_remote_code":true, "skip_tokenizer_init":true, "mem_fraction_static":"" }
+sglang_disagg:   { "disagg_transfer_backend":"nixl", "disagg_bootstrap_port":30001 }
+command_extras:  { "worker":"", "frontend":"", "planner":"", "prometheus":"" }
+```
+
+You can override only what you need; leaving an input blank (or omitting via CLI) keeps the defaults. For non‑SGLang runtimes the SGLang JSON inputs are ignored.
 
 #### Prerequisites (deploy-model)
 
@@ -94,68 +118,48 @@ The YAML files support the following common environment placeholders:
 | `${PLANNER_REPLICAS}`    | Replica count for `Planner` service (planner template only).    | `1`                                           |
 | `${PROMETHEUS_REPLICAS}` | Replica count for `Prometheus` service (planner template only). | `1`                                           |
 
-### Additional SGLang-Specific Inputs / Placeholders
+### SGLang-Specific JSON Keys / Placeholders
 
-The SGLang templates (and command builder step) also recognize these inputs (values are passed through as environment variables prior to `envsubst`):
+The SGLang JSON inputs map 1:1 to environment variables consumed by templates and the command builder step:
 
-| Input / Placeholder                                                | Purpose / Effect                                   | Typical Default | Example (DeepSeek) |
-| ------------------------------------------------------------------ | -------------------------------------------------- | --------------- | ------------------ |
-| `page_size` / `${PAGE_SIZE}`                                       | Token page size passed to SGLang                   | 16              | 16                 |
-| `tp_size` / `${TP_SIZE}`                                           | Tensor parallel size (`--tp`)                      | 1               | 8                  |
-| `dp_size` / `${DP_SIZE}`                                           | Data parallel size (`--dp`, omitted when 1)        | 1               | 8                  |
-| `ep_size` / `${EP_SIZE}`                                           | Expert parallel size (`--ep-size`, omitted when 1) | 1               | 8                  |
-| `decode_gpus` / `${DECODE_GPUS}`                                   | GPUs per decode worker pod (resource limit)        | 1               | 8                  |
-| `prefill_gpus` / `${PREFILL_GPUS}`                                 | GPUs per prefill worker pod                        | 1               | 8                  |
-| `enable_dp_attention` / `${ENABLE_DP_ATTENTION}`                   | Adds `--enable-dp-attention` when true             | false           | true               |
-| `trust_remote_code` / `${TRUST_REMOTE_CODE}`                       | Adds `--trust-remote-code` when true               | true            | true               |
-| `skip_tokenizer_init` / `${SKIP_TOKENIZER_INIT}`                   | Adds `--skip-tokenizer-init` when true             | true            | true               |
-| `disagg_transfer_backend` / `${DISAGG_TRANSFER_BACKEND}`           | Backend for disaggregation transfer                | nixl            | nixl               |
-| `disagg_bootstrap_port` / `${DISAGG_BOOTSTRAP_PORT}`               | Port used for bootstrap in disagg mode             | 30001           | 30001              |
-| `mem_fraction_static` / `${MEM_FRACTION_STATIC}`                   | Adds `--mem-fraction-static <value>` if non-empty  | (empty)         | 0.82               |
-| `multinode_decode_node_count` / `${MULTINODE_DECODE_NODE_COUNT}`   | nodeCount for decode (multinode template)          | 1               | 1 (or >1)          |
-| `multinode_prefill_node_count` / `${MULTINODE_PREFILL_NODE_COUNT}` | nodeCount for prefill (multinode template)         | 1               | 1 (or >1)          |
-| `worker_command_extra` / `$WORKER_COMMAND_EXTRA`                   | Appended verbatim to decode/prefill commands       | (empty)         | (optional)         |
-| `frontend_command_extra` / `$FRONTEND_COMMAND_EXTRA`               | Extra flags for frontend (aggregate variants)      | (empty)         | (optional)         |
-| `planner_command_extra` / `$PLANNER_COMMAND_EXTRA`                 | Extra flags for planner (planner template)         | (empty)         | (optional)         |
-| `prometheus_command_extra` / `$PROMETHEUS_COMMAND_EXTRA`           | Extra flags for prometheus (planner template)      | (empty)         | (optional)         |
+| JSON Input       | Key                            | Placeholder / Env                 | Notes                                  |
+| ---------------- | ------------------------------ | --------------------------------- | -------------------------------------- |
+| `sglang_scaling` | `page_size`                    | `${PAGE_SIZE}`                    | Token page size.                       |
+|                  | `tp_size`                      | `${TP_SIZE}`                      | Tensor parallel.                       |
+|                  | `dp_size`                      | `${DP_SIZE}`                      | Data parallel (omitted in CLI when 1). |
+|                  | `ep_size`                      | `${EP_SIZE}`                      | Expert parallel (omitted when 1).      |
+|                  | `decode_gpus`                  | `${DECODE_GPUS}`                  | GPUs per decode worker pod.            |
+|                  | `prefill_gpus`                 | `${PREFILL_GPUS}`                 | GPUs per prefill worker pod.           |
+|                  | `multinode_decode_node_count`  | `${MULTINODE_DECODE_NODE_COUNT}`  | Multi-node template only.              |
+|                  | `multinode_prefill_node_count` | `${MULTINODE_PREFILL_NODE_COUNT}` | Multi-node template only.              |
+| `sglang_flags`   | `enable_dp_attention`          | `${ENABLE_DP_ATTENTION}`          | Adds flag if true.                     |
+|                  | `trust_remote_code`            | `${TRUST_REMOTE_CODE}`            | Adds flag if true.                     |
+|                  | `skip_tokenizer_init`          | `${SKIP_TOKENIZER_INIT}`          | Adds flag if true.                     |
+|                  | `mem_fraction_static`          | `${MEM_FRACTION_STATIC}`          | Adds flag when non-empty.              |
+| `sglang_disagg`  | `disagg_transfer_backend`      | `${DISAGG_TRANSFER_BACKEND}`      | Disaggregation mode templates.         |
+|                  | `disagg_bootstrap_port`        | `${DISAGG_BOOTSTRAP_PORT}`        | Port for bootstrap.                    |
+| `command_extras` | `worker`                       | `$WORKER_COMMAND_EXTRA`           | Appended to decode/prefill commands.   |
+|                  | `frontend`                     | `$FRONTEND_COMMAND_EXTRA`         | Frontend command extension.            |
+|                  | `planner`                      | `$PLANNER_COMMAND_EXTRA`          | Planner template only.                 |
+|                  | `prometheus`                   | `$PROMETHEUS_COMMAND_EXTRA`       | Planner template only.                 |
 
-The workflow dynamically assembles role-specific commands (Frontend / decode / prefill / planner / prometheus) and injects them as environment variables consumed by the templates.
+Replica environment variables originate from `replicas` JSON keys: `FRONTEND_REPLICAS`, `DECODE_REPLICAS`, `PREFILL_REPLICAS`, `PLANNER_REPLICAS`, `PROMETHEUS_REPLICAS`.
 
-All placeholders are resolved via `envsubst` in the `deploy-model` workflow, and the workflow will coerce provided values into integers before applying the manifest.
+All placeholders are resolved via `envsubst` and replicas are integer-normalized post-render.
 
 ---
 
 ## Simple Qwen (SGLang, Aggregate) Example
 
-Minimal aggregate deployment using the `agg` template (single frontend + single decode worker) and the Qwen 0.6B model.
+Minimal aggregate deployment (single frontend + single decode worker) with defaults. Because all defaults already match what we need, only the required inputs are necessary.
 
-| Input                | Value                               |
-| -------------------- | ----------------------------------- |
-| runtime              | `sglang`                            |
-| deployment_type      | `agg`                               |
-| main_container_image | `my-registry/sglang-runtime:latest` |
-| model_name           | `Qwen/Qwen3-0.6B`                   |
-| frontend_replicas    | `1`                                 |
-| decode_replicas      | `1`                                 |
-| prefill_replicas     | `1` (unused in agg; safe default)   |
-| planner_replicas     | `1` (unused; required input)        |
-| prometheus_replicas  | `1` (unused; required input)        |
-| page_size            | `16` (default)                      |
-| tp_size              | `1` (default)                       |
-| dp_size              | `1` (default)                       |
-| ep_size              | `1` (default)                       |
-| decode_gpus          | `1` (default)                       |
-| prefill_gpus         | `1` (default)                       |
-| trust_remote_code    | `true` (default)                    |
-| skip_tokenizer_init  | `true` (default)                    |
-
-### Prefilled Dispatch URL (Qwen Aggregate)
+### Prefilled Dispatch URL (Defaults Only)
 
 ```text
-https://github.com/sozercan/dynamo-actions/actions/workflows/deploy-model.yaml/dispatches/new?ref=main&inputs[runtime]=sglang&inputs[deployment_type]=agg&inputs[main_container_image]=my-registry/sglang-runtime:latest&inputs[model_name]=Qwen/Qwen3-0.6B&inputs[frontend_replicas]=1&inputs[decode_replicas]=1&inputs[prefill_replicas]=1&inputs[planner_replicas]=1&inputs[prometheus_replicas]=1
+https://github.com/sozercan/dynamo-actions/actions/workflows/deploy-model.yaml/dispatches/new?ref=main&inputs[runtime]=sglang&inputs[deployment_type]=agg&inputs[main_container_image]=my-registry/sglang-runtime:latest&inputs[model_name]=Qwen/Qwen3-0.6B
 ```
 
-### GitHub CLI Invocation (Qwen Aggregate)
+### CLI (Explicit Replicas JSON – optional)
 
 ```bash
 gh workflow run deploy-model.yaml \
@@ -164,38 +168,14 @@ gh workflow run deploy-model.yaml \
   -f deployment_type=agg \
   -f main_container_image=my-registry/sglang-runtime:latest \
   -f model_name=Qwen/Qwen3-0.6B \
-  -f frontend_replicas=1 \
-  -f decode_replicas=1 \
-  -f prefill_replicas=1 \
-  -f planner_replicas=1 \
-  -f prometheus_replicas=1
+  -f replicas='{"frontend":1,"decode":1,"prefill":1,"planner":1,"prometheus":1}'
 ```
 
 ---
 
 ## Simple Qwen (vLLM, Aggregate) Example
 
-Minimal aggregate deployment using the vLLM `agg` template (single frontend + single decode + single prefill worker) and the Qwen 0.6B model.
-
-| Input                | Value                             |
-| -------------------- | --------------------------------- |
-| runtime              | `vllm`                            |
-| deployment_type      | `agg`                             |
-| main_container_image | `my-registry/vllm-runtime:latest` |
-| model_name           | `Qwen/Qwen3-0.6B`                 |
-| frontend_replicas    | `1`                               |
-| decode_replicas      | `1`                               |
-| prefill_replicas     | `1`                               |
-| planner_replicas     | `1` (unused; required input)      |
-| prometheus_replicas  | `1` (unused; required input)      |
-
-### Prefilled Dispatch URL (Qwen vLLM Aggregate)
-
-```text
-https://github.com/sozercan/dynamo-actions/actions/workflows/deploy-model.yaml/dispatches/new?ref=main&inputs[runtime]=vllm&inputs[deployment_type]=agg&inputs[main_container_image]=my-registry/vllm-runtime:latest&inputs[model_name]=Qwen/Qwen3-0.6B&inputs[frontend_replicas]=1&inputs[decode_replicas]=1&inputs[prefill_replicas]=1&inputs[planner_replicas]=1&inputs[prometheus_replicas]=1
-```
-
-### GitHub CLI Invocation (Qwen vLLM Aggregate)
+Defaults also suffice for vLLM aggregate; only required inputs are needed.
 
 ```bash
 gh workflow run deploy-model.yaml \
@@ -203,58 +183,14 @@ gh workflow run deploy-model.yaml \
   -f runtime=vllm \
   -f deployment_type=agg \
   -f main_container_image=my-registry/vllm-runtime:latest \
-  -f model_name=Qwen/Qwen3-0.6B \
-  -f frontend_replicas=1 \
-  -f decode_replicas=1 \
-  -f prefill_replicas=1 \
-  -f planner_replicas=1 \
-  -f prometheus_replicas=1
+  -f model_name=Qwen/Qwen3-0.6B
 ```
 
 ---
 
 ## DeepSeek (SGLang, Disaggregated) Example
 
-Below is a reference configuration approximating the DeepSeek R1 disaggregated setup (single pod per role with 8 GPUs each, 8-way TP/DP/EP). Adjust the image to your built SGLang runtime.
-
-| Input                        | Value                                          |
-| ---------------------------- | ---------------------------------------------- |
-| runtime                      | `sglang`                                       |
-| deployment_type              | `disagg`                                       |
-| main_container_image         | `my-registry/sglang-wideep-runtime:latest`     |
-| model_name                   | `deepseek-ai/DeepSeek-R1`                      |
-| frontend_replicas            | `1`                                            |
-| decode_replicas              | `1`                                            |
-| prefill_replicas             | `1`                                            |
-| planner_replicas             | `1` (unused by plain disagg; safe default)     |
-| prometheus_replicas          | `1` (unused by plain disagg; safe default)     |
-| page_size                    | `16`                                           |
-| tp_size                      | `8`                                            |
-| dp_size                      | `8`                                            |
-| ep_size                      | `8`                                            |
-| decode_gpus                  | `8`                                            |
-| prefill_gpus                 | `8`                                            |
-| enable_dp_attention          | `true`                                         |
-| trust_remote_code            | `true`                                         |
-| skip_tokenizer_init          | `true`                                         |
-| disagg_transfer_backend      | `nixl`                                         |
-| disagg_bootstrap_port        | `30001`                                        |
-| mem_fraction_static          | `0.82`                                         |
-| multinode_decode_node_count  | `1`                                            |
-| multinode_prefill_node_count | `1`                                            |
-| worker_command_extra         | (leave blank unless adding experimental flags) |
-
-### Prefilled Dispatch URL
-
-Click (or copy) this URL to open the GitHub UI with fields pre-populated:
-
-```text
-https://github.com/sozercan/dynamo-actions/actions/workflows/deploy-model.yaml/dispatches/new?ref=main&inputs[runtime]=sglang&inputs[deployment_type]=disagg&inputs[main_container_image]=my-registry/sglang-wideep-runtime:latest&inputs[model_name]=deepseek-ai/DeepSeek-R1&inputs[frontend_replicas]=1&inputs[decode_replicas]=1&inputs[prefill_replicas]=1&inputs[planner_replicas]=1&inputs[prometheus_replicas]=1&inputs[page_size]=16&inputs[tp_size]=8&inputs[dp_size]=8&inputs[ep_size]=8&inputs[decode_gpus]=8&inputs[prefill_gpus]=8&inputs[enable_dp_attention]=true&inputs[trust_remote_code]=true&inputs[skip_tokenizer_init]=true&inputs[disagg_transfer_backend]=nixl&inputs[disagg_bootstrap_port]=30001&inputs[mem_fraction_static]=0.82&inputs[multinode_decode_node_count]=1&inputs[multinode_prefill_node_count]=1
-```
-
-If the image name or model include characters that break the query, URL-encode them (`:` → `%3A`, `/` → `%2F`).
-
-### GitHub CLI Invocation
+Reference configuration approximating the DeepSeek R1 disaggregated setup (single pod per role with 8 GPUs each, 8‑way TP/DP/EP). Adjust the image as needed.
 
 ```bash
 gh workflow run deploy-model.yaml \
@@ -263,27 +199,17 @@ gh workflow run deploy-model.yaml \
   -f deployment_type=disagg \
   -f main_container_image=my-registry/sglang-wideep-runtime:latest \
   -f model_name=deepseek-ai/DeepSeek-R1 \
-  -f frontend_replicas=1 \
-  -f decode_replicas=1 \
-  -f prefill_replicas=1 \
-  -f planner_replicas=1 \
-  -f prometheus_replicas=1 \
-  -f page_size=16 \
-  -f tp_size=8 \
-  -f dp_size=8 \
-  -f ep_size=8 \
-  -f decode_gpus=8 \
-  -f prefill_gpus=8 \
-  -f enable_dp_attention=true \
-  -f trust_remote_code=true \
-  -f skip_tokenizer_init=true \
-  -f disagg_transfer_backend=nixl \
-  -f disagg_bootstrap_port=30001 \
-  -f mem_fraction_static=0.82 \
-  -f multinode_decode_node_count=1 \
-  -f multinode_prefill_node_count=1
+  -f replicas='{"frontend":1,"decode":1,"prefill":1,"planner":1,"prometheus":1}' \
+  -f sglang_scaling='{"page_size":16,"tp_size":8,"dp_size":8,"ep_size":8,"decode_gpus":8,"prefill_gpus":8,"multinode_decode_node_count":1,"multinode_prefill_node_count":1}' \
+  -f sglang_flags='{"enable_dp_attention":true,"trust_remote_code":true,"skip_tokenizer_init":true,"mem_fraction_static":"0.82"}' \
+  -f sglang_disagg='{"disagg_transfer_backend":"nixl","disagg_bootstrap_port":30001}'
 ```
 
+URL form (JSON must be URL‑encoded, example shown partially encoded):
+
+```text
+https://github.com/sozercan/dynamo-actions/actions/workflows/deploy-model.yaml/dispatches/new?ref=main&inputs[runtime]=sglang&inputs[deployment_type]=disagg&inputs[main_container_image]=my-registry/sglang-wideep-runtime:latest&inputs[model_name]=deepseek-ai/DeepSeek-R1&inputs[sglang_scaling]=%7B%22page_size%22:16,%22tp_size%22:8,%22dp_size%22:8,%22ep_size%22:8,%22decode_gpus%22:8,%22prefill_gpus%22:8,%22multinode_decode_node_count%22:1,%22multinode_prefill_node_count%22:1%7D&inputs[sglang_flags]=%7B%22enable_dp_attention%22:true,%22trust_remote_code%22:true,%22skip_tokenizer_init%22:true,%22mem_fraction_static%22:%220.82%22%7D&inputs[sglang_disagg]=%7B%22disagg_transfer_backend%22:%22nixl%22,%22disagg_bootstrap_port%22:30001%7D
+```
 
 ### Notes
 

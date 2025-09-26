@@ -32,115 +32,31 @@ on:
         description: "Model identifier passed to dynamo.vllm"
         default: Qwen/Qwen3-0.6B
         required: true
-      frontend_replicas:
-        description: "Replica count for Frontend"
-        type: number
-        default: 1
-        required: true
-      decode_replicas:
-        description: "Replica count for VllmDecodeWorker"
-        type: number
-        default: 1
-        required: true
-      prefill_replicas:
-        description: "Replica count for VllmPrefillWorker"
-        type: number
-        default: 1
-        required: true
-      planner_replicas:
-        description: "Replica count for Planner"
-        type: number
-        default: 1
-        required: true
-      prometheus_replicas:
-        description: "Replica count for Prometheus"
-        type: number
-        default: 1
-        required: true
-      # SGLANG specific / advanced inputs (ignored for vllm unless later templates use them)
-      page_size:
-        description: "Token page size (sglang)"
-        type: number
-        default: 16
-        required: true
-      tp_size:
-        description: "Tensor parallel size (sglang)"
-        type: number
-        default: 1
-        required: true
-      dp_size:
-        description: "Data parallel size (sglang)"
-        type: number
-        default: 1
-        required: true
-      ep_size:
-        description: "Expert parallel size (sglang)"
-        type: number
-        default: 1
-        required: true
-      decode_gpus:
-        description: "Number of GPUs per decode worker (sglang)"
-        type: number
-        default: 1
-        required: true
-      prefill_gpus:
-        description: "Number of GPUs per prefill worker (sglang)"
-        type: number
-        default: 1
-        required: true
-      enable_dp_attention:
-        description: "Enable DP attention optimization (sglang)"
-        type: boolean
-        default: false
-        required: true
-      trust_remote_code:
-        description: "Pass --trust-remote-code (sglang)"
-        type: boolean
-        default: true
-        required: true
-      skip_tokenizer_init:
-        description: "Skip tokenizer init (sglang)"
-        type: boolean
-        default: true
-        required: true
-      disagg_transfer_backend:
-        description: "Disaggregation transfer backend (sglang)"
-        default: nixl
-        required: true
-      disagg_bootstrap_port:
-        description: "Disaggregation bootstrap port (sglang)"
-        type: number
-        default: 30001
-        required: true
-      mem_fraction_static:
-        description: "Static memory fraction (sglang, optional)"
-        default: ""
+      replicas:
+        description: >-
+          JSON map of replica counts. Keys: frontend, decode, prefill, planner, prometheus.
+          Example: {"frontend":1,"decode":1,"prefill":1,"planner":1,"prometheus":1}
+        default: '{"frontend":1,"decode":1,"prefill":1,"planner":1,"prometheus":1}'
         required: false
-      multinode_decode_node_count:
-        description: "Multinode nodeCount for decode (sglang multi-node)"
-        type: number
-        default: 1
-        required: true
-      multinode_prefill_node_count:
-        description: "Multinode nodeCount for prefill (sglang multi-node)"
-        type: number
-        default: 1
-        required: true
-      worker_command_extra:
-        description: "Extra flags appended to worker commands (sglang)"
-        default: ""
+      sglang_scaling:
+        description: >-
+          JSON for SGLang scaling: page_size,tp_size,dp_size,ep_size,decode_gpus,prefill_gpus,multinode_decode_node_count,multinode_prefill_node_count.
+        default: '{"page_size":16,"tp_size":1,"dp_size":1,"ep_size":1,"decode_gpus":1,"prefill_gpus":1,"multinode_decode_node_count":1,"multinode_prefill_node_count":1}'
         required: false
-      frontend_command_extra:
-        description: "Extra flags appended to frontend command (sglang)"
-        default: ""
+      sglang_flags:
+        description: >-
+          JSON for boolean / misc flags: enable_dp_attention,trust_remote_code,skip_tokenizer_init,mem_fraction_static.
+        default: '{"enable_dp_attention":false,"trust_remote_code":true,"skip_tokenizer_init":true,"mem_fraction_static":""}'
         required: false
-      planner_command_extra:
-        description: "Extra flags appended to planner command (sglang planner template)"
-        default: ""
+      sglang_disagg:
+        description: >-
+          JSON for disaggregation params: disagg_transfer_backend,disagg_bootstrap_port.
+        default: '{"disagg_transfer_backend":"nixl","disagg_bootstrap_port":30001}'
         required: false
-      prometheus_command_extra:
-        description: "Extra flags appended to prometheus command (sglang planner template)"
-        default: ""
+      command_extras:
+        description: >-
+          JSON for extra command fragments: worker,frontend,planner,prometheus.
+        default: '{"worker":"","frontend":"","planner":"","prometheus":""}'
         required: false
 
 permissions: read-all
@@ -157,26 +73,94 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      - name: Parse configuration inputs
+        id: parse
+        env:
+          RUNTIME: ${{ github.event.inputs.runtime }}
+          REPLICAS_JSON: ${{ github.event.inputs.replicas }}
+          SGLANG_SCALING_JSON: ${{ github.event.inputs.sglang_scaling }}
+          SGLANG_FLAGS_JSON: ${{ github.event.inputs.sglang_flags }}
+          SGLANG_DISAGG_JSON: ${{ github.event.inputs.sglang_disagg }}
+          COMMAND_EXTRAS_JSON: ${{ github.event.inputs.command_extras }}
+        shell: python
+        run: |
+          import os, json, sys
+
+          def load(name, default):
+              raw = os.environ.get(name, '').strip()
+              if not raw:
+                  raw = default
+              try:
+                  return json.loads(raw)
+              except json.JSONDecodeError:
+                  print(f"::warning::Invalid JSON for {name}; using defaults")
+                  return json.loads(default)
+
+          replicas = load('REPLICAS_JSON', '{"frontend":1,"decode":1,"prefill":1,"planner":1,"prometheus":1}')
+          scaling = load('SGLANG_SCALING_JSON', '{"page_size":16,"tp_size":1,"dp_size":1,"ep_size":1,"decode_gpus":1,"prefill_gpus":1,"multinode_decode_node_count":1,"multinode_prefill_node_count":1}')
+          flags = load('SGLANG_FLAGS_JSON', '{"enable_dp_attention":false,"trust_remote_code":true,"skip_tokenizer_init":true,"mem_fraction_static":""}')
+          disagg = load('SGLANG_DISAGG_JSON', '{"disagg_transfer_backend":"nixl","disagg_bootstrap_port":30001}')
+          extras = load('COMMAND_EXTRAS_JSON', '{"worker":"","frontend":"","planner":"","prometheus":""}')
+
+          # Export replica env vars
+          mappings = {
+              'FRONTEND_REPLICAS': replicas.get('frontend', 1),
+              'DECODE_REPLICAS': replicas.get('decode', 1),
+              'PREFILL_REPLICAS': replicas.get('prefill', 1),
+              'PLANNER_REPLICAS': replicas.get('planner', 1),
+              'PROMETHEUS_REPLICAS': replicas.get('prometheus', 1),
+              'PAGE_SIZE': scaling.get('page_size', 16),
+              'TP_SIZE': scaling.get('tp_size', 1),
+              'DP_SIZE': scaling.get('dp_size', 1),
+              'EP_SIZE': scaling.get('ep_size', 1),
+              'DECODE_GPUS': scaling.get('decode_gpus', 1),
+              'PREFILL_GPUS': scaling.get('prefill_gpus', 1),
+              'MULTINODE_DECODE_NODE_COUNT': scaling.get('multinode_decode_node_count', 1),
+              'MULTINODE_PREFILL_NODE_COUNT': scaling.get('multinode_prefill_node_count', 1),
+              'ENABLE_DP_ATTENTION': str(flags.get('enable_dp_attention', False)).lower(),
+              'TRUST_REMOTE_CODE': str(flags.get('trust_remote_code', True)).lower(),
+              'SKIP_TOKENIZER_INIT': str(flags.get('skip_tokenizer_init', True)).lower(),
+              'MEM_FRACTION_STATIC': flags.get('mem_fraction_static', ''),
+              'DISAGG_TRANSFER_BACKEND': disagg.get('disagg_transfer_backend', 'nixl'),
+              'DISAGG_BOOTSTRAP_PORT': disagg.get('disagg_bootstrap_port', 30001),
+              'WORKER_COMMAND_EXTRA': extras.get('worker', ''),
+              'FRONTEND_COMMAND_EXTRA': extras.get('frontend', ''),
+              'PLANNER_COMMAND_EXTRA': extras.get('planner', ''),
+              'PROMETHEUS_COMMAND_EXTRA': extras.get('prometheus', ''),
+          }
+
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as fh:
+              for k, v in mappings.items():
+                  fh.write(f"{k}={v}\n")
+
+          # Echo a summary
+          print("Parsed replicas:", replicas)
+          if os.environ.get('RUNTIME') == 'sglang':
+              print("Parsed sglang scaling:", scaling)
+              print("Parsed sglang flags:", flags)
+              print("Parsed sglang disagg:", disagg)
+              print("Parsed command extras:", extras)
+
       - name: Build sglang commands (if runtime=sglang)
         id: build-sglang
         env:
           RUNTIME: ${{ github.event.inputs.runtime }}
           DEPLOYMENT_TYPE: ${{ github.event.inputs.deployment_type }}
           MODEL: ${{ github.event.inputs.model_name }}
-          PAGE_SIZE: ${{ github.event.inputs.page_size }}
-          TP_SIZE: ${{ github.event.inputs.tp_size }}
-          DP_SIZE: ${{ github.event.inputs.dp_size }}
-          EP_SIZE: ${{ github.event.inputs.ep_size }}
-          ENABLE_DP_ATTENTION: ${{ github.event.inputs.enable_dp_attention }}
-          TRUST_REMOTE_CODE: ${{ github.event.inputs.trust_remote_code }}
-          SKIP_TOKENIZER_INIT: ${{ github.event.inputs.skip_tokenizer_init }}
-          DISAGG_TRANSFER_BACKEND: ${{ github.event.inputs.disagg_transfer_backend }}
-          DISAGG_BOOTSTRAP_PORT: ${{ github.event.inputs.disagg_bootstrap_port }}
-          MEM_FRACTION_STATIC: ${{ github.event.inputs.mem_fraction_static }}
-          WORKER_COMMAND_EXTRA: ${{ github.event.inputs.worker_command_extra }}
-          FRONTEND_COMMAND_EXTRA: ${{ github.event.inputs.frontend_command_extra }}
-          PLANNER_COMMAND_EXTRA: ${{ github.event.inputs.planner_command_extra }}
-          PROMETHEUS_COMMAND_EXTRA: ${{ github.event.inputs.prometheus_command_extra }}
+          PAGE_SIZE: ${{ env.PAGE_SIZE }}
+          TP_SIZE: ${{ env.TP_SIZE }}
+          DP_SIZE: ${{ env.DP_SIZE }}
+          EP_SIZE: ${{ env.EP_SIZE }}
+          ENABLE_DP_ATTENTION: ${{ env.ENABLE_DP_ATTENTION }}
+          TRUST_REMOTE_CODE: ${{ env.TRUST_REMOTE_CODE }}
+          SKIP_TOKENIZER_INIT: ${{ env.SKIP_TOKENIZER_INIT }}
+          DISAGG_TRANSFER_BACKEND: ${{ env.DISAGG_TRANSFER_BACKEND }}
+          DISAGG_BOOTSTRAP_PORT: ${{ env.DISAGG_BOOTSTRAP_PORT }}
+          MEM_FRACTION_STATIC: ${{ env.MEM_FRACTION_STATIC }}
+          WORKER_COMMAND_EXTRA: ${{ env.WORKER_COMMAND_EXTRA }}
+          FRONTEND_COMMAND_EXTRA: ${{ env.FRONTEND_COMMAND_EXTRA }}
+          PLANNER_COMMAND_EXTRA: ${{ env.PLANNER_COMMAND_EXTRA }}
+          PROMETHEUS_COMMAND_EXTRA: ${{ env.PROMETHEUS_COMMAND_EXTRA }}
         run: |
           set -euo pipefail
           if [ "$RUNTIME" != "sglang" ]; then
@@ -224,26 +208,26 @@ jobs:
           DEPLOYMENT_TYPE: ${{ github.event.inputs.deployment_type }}
           MAIN_CONTAINER_IMAGE: ${{ github.event.inputs.main_container_image }}
           MODEL: ${{ github.event.inputs.model_name }}
-          FRONTEND_REPLICAS: ${{ github.event.inputs.frontend_replicas }}
-          DECODE_REPLICAS: ${{ github.event.inputs.decode_replicas }}
-          PREFILL_REPLICAS: ${{ github.event.inputs.prefill_replicas }}
-          PLANNER_REPLICAS: ${{ github.event.inputs.planner_replicas }}
-          PROMETHEUS_REPLICAS: ${{ github.event.inputs.prometheus_replicas }}
+          FRONTEND_REPLICAS: ${{ env.FRONTEND_REPLICAS }}
+          DECODE_REPLICAS: ${{ env.DECODE_REPLICAS }}
+          PREFILL_REPLICAS: ${{ env.PREFILL_REPLICAS }}
+          PLANNER_REPLICAS: ${{ env.PLANNER_REPLICAS }}
+          PROMETHEUS_REPLICAS: ${{ env.PROMETHEUS_REPLICAS }}
           # sglang extras for envsubst (even if not used by vllm templates)
-          PAGE_SIZE: ${{ github.event.inputs.page_size }}
-          TP_SIZE: ${{ github.event.inputs.tp_size }}
-          DP_SIZE: ${{ github.event.inputs.dp_size }}
-          EP_SIZE: ${{ github.event.inputs.ep_size }}
-          DECODE_GPUS: ${{ github.event.inputs.decode_gpus }}
-          PREFILL_GPUS: ${{ github.event.inputs.prefill_gpus }}
-          ENABLE_DP_ATTENTION: ${{ github.event.inputs.enable_dp_attention }}
-          TRUST_REMOTE_CODE: ${{ github.event.inputs.trust_remote_code }}
-          SKIP_TOKENIZER_INIT: ${{ github.event.inputs.skip_tokenizer_init }}
-          DISAGG_TRANSFER_BACKEND: ${{ github.event.inputs.disagg_transfer_backend }}
-          DISAGG_BOOTSTRAP_PORT: ${{ github.event.inputs.disagg_bootstrap_port }}
-          MEM_FRACTION_STATIC: ${{ github.event.inputs.mem_fraction_static }}
-          MULTINODE_DECODE_NODE_COUNT: ${{ github.event.inputs.multinode_decode_node_count }}
-          MULTINODE_PREFILL_NODE_COUNT: ${{ github.event.inputs.multinode_prefill_node_count }}
+          PAGE_SIZE: ${{ env.PAGE_SIZE }}
+          TP_SIZE: ${{ env.TP_SIZE }}
+          DP_SIZE: ${{ env.DP_SIZE }}
+          EP_SIZE: ${{ env.EP_SIZE }}
+          DECODE_GPUS: ${{ env.DECODE_GPUS }}
+          PREFILL_GPUS: ${{ env.PREFILL_GPUS }}
+          ENABLE_DP_ATTENTION: ${{ env.ENABLE_DP_ATTENTION }}
+          TRUST_REMOTE_CODE: ${{ env.TRUST_REMOTE_CODE }}
+          SKIP_TOKENIZER_INIT: ${{ env.SKIP_TOKENIZER_INIT }}
+          DISAGG_TRANSFER_BACKEND: ${{ env.DISAGG_TRANSFER_BACKEND }}
+          DISAGG_BOOTSTRAP_PORT: ${{ env.DISAGG_BOOTSTRAP_PORT }}
+          MEM_FRACTION_STATIC: ${{ env.MEM_FRACTION_STATIC }}
+          MULTINODE_DECODE_NODE_COUNT: ${{ env.MULTINODE_DECODE_NODE_COUNT }}
+          MULTINODE_PREFILL_NODE_COUNT: ${{ env.MULTINODE_PREFILL_NODE_COUNT }}
           FRONTEND_COMMAND: ${{ env.FRONTEND_COMMAND }}
           DECODE_COMMAND: ${{ env.DECODE_COMMAND }}
           PREFILL_COMMAND: ${{ env.PREFILL_COMMAND }}
@@ -268,11 +252,11 @@ jobs:
       - name: Override replica counts
         env:
           MANIFEST: ${{ steps.render.outputs.manifest_path }}
-          FRONTEND_REPLICAS: ${{ github.event.inputs.frontend_replicas }}
-          DECODE_REPLICAS: ${{ github.event.inputs.decode_replicas }}
-          PREFILL_REPLICAS: ${{ github.event.inputs.prefill_replicas }}
-          PLANNER_REPLICAS: ${{ github.event.inputs.planner_replicas }}
-          PROMETHEUS_REPLICAS: ${{ github.event.inputs.prometheus_replicas }}
+          FRONTEND_REPLICAS: ${{ env.FRONTEND_REPLICAS }}
+          DECODE_REPLICAS: ${{ env.DECODE_REPLICAS }}
+          PREFILL_REPLICAS: ${{ env.PREFILL_REPLICAS }}
+          PLANNER_REPLICAS: ${{ env.PLANNER_REPLICAS }}
+          PROMETHEUS_REPLICAS: ${{ env.PROMETHEUS_REPLICAS }}
         shell: python
         run: |
           import os
