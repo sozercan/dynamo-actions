@@ -18,6 +18,8 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 60
     steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Verify kubectl, helm, and docker
         run: |
           set -euo pipefail
@@ -30,7 +32,46 @@ jobs:
           kubectl version --client
           helm version
           docker version
-      - run: nvidia-smi
+      - name: Validate cluster NVIDIA GPUs
+        run: |
+          set -euo pipefail
+          echo "Checking for GPU-capable nodes (allocatable nvidia.com/gpu > 0)..."
+          gpu_nodes=$(kubectl get nodes -o json | jq -r '.items[] | select(.status.allocatable["nvidia.com/gpu"] != null and .status.allocatable["nvidia.com/gpu"] != "0") | .metadata.name')
+          if [ -z "$gpu_nodes" ]; then
+            echo "::error::No nodes with allocatable nvidia.com/gpu found in cluster" >&2
+            kubectl get nodes -o wide || true
+            exit 1
+          fi
+          echo "GPU nodes detected:"; echo "$gpu_nodes" | sed 's/^/ - /'
+
+          POD_NAME=nvidia-smi-check
+          POD_MANIFEST=deploy/util/gpu-validation-pod.yaml
+          echo "Applying GPU validation pod manifest $POD_MANIFEST..."
+          [ -f "$POD_MANIFEST" ] || { echo "::error::Manifest $POD_MANIFEST not found" >&2; exit 1; }
+          kubectl apply -f "$POD_MANIFEST"
+
+          echo "Waiting for pod to become Ready..."
+          if ! kubectl wait --for=condition=Ready pod/${POD_NAME} --timeout=180s; then
+            echo "::error::GPU validation pod failed to become Ready" >&2
+            kubectl describe pod ${POD_NAME} || true
+            kubectl logs ${POD_NAME} || true
+            kubectl delete pod ${POD_NAME} --ignore-not-found --wait=false || true
+            exit 1
+          fi
+
+          echo "Running nvidia-smi inside the pod..."
+          if ! kubectl exec -i ${POD_NAME} -- nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv; then
+            echo "::error::Failed to execute nvidia-smi inside GPU pod" >&2
+            kubectl delete pod ${POD_NAME} --wait=false || true
+            exit 1
+          fi
+
+          echo "Detailed GPU listing (nvidia-smi -L):"
+          kubectl exec -i ${POD_NAME} -- nvidia-smi -L || true
+
+          echo "Cleaning up validation pod..."
+          kubectl delete pod ${POD_NAME} --wait=true
+          echo "Cluster GPU validation succeeded."
       - name: Resolve dynamo version
         env:
           INPUT_DYNAMO_VERSION: ${{ github.event.inputs.dynamo_version }}

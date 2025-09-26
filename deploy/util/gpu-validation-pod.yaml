@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nvidia-smi-check
+  labels:
+    purpose: gpu-validation
+spec:
+  restartPolicy: Never
+  containers:
+  - name: test
+    image: nvcr.io/nvidia/cuda:12.4.1-base-ubuntu22.04
+    command: ["sleep","3600"]
+    resources:
+      limits:
+        cpu: 100m
+        memory: 256Mi
+        nvidia.com/gpu: 1
+      requests:
+        cpu: 50m
+        memory: 128Mi
+        nvidia.com/gpu: 1
