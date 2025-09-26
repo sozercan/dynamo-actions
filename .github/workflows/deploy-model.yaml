@@ -388,7 +388,7 @@ jobs:
           # Build JSON payload (MODEL_NAME already an env var; avoid heredoc to keep YAML parser happy)
           CHAT_REQ_EVAL=$(printf '{"model":"%s","messages":[{"role":"user","content":"Hello!"}],"max_tokens":20}' "${MODEL_NAME}")
           CHAT_RESP_HTTP=$(mktemp)
-          HTTP_CODE=$(echo "$CHAT_REQ_EVAL" | curl -s -o "$CHAT_RESP_HTTP" -w '%{http_code}' -H 'Content-Type: application/json' http://localhost:8000/v1/chat/completions || true)
+          HTTP_CODE=$(curl -s -o "$CHAT_RESP_HTTP" -w '%{http_code}' -H 'Content-Type: application/json' -X POST --data "$CHAT_REQ_EVAL" http://localhost:8000/v1/chat/completions || true)
 
           echo "HTTP status: $HTTP_CODE"
             # Show response (truncate if huge)
