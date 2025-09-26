@@ -10,60 +10,42 @@ spec:
     Frontend:
       dynamoNamespace: sglang-disagg
       componentType: frontend
-      replicas: 1
+      replicas: 1 # overridden by workflow if FRONTEND_REPLICAS provided
       extraPodSpec:
         mainContainer:
-          image: my-registry/sglang-runtime:my-tag
+          image: $MAIN_CONTAINER_IMAGE
     decode:
       envFromSecret: hf-token-secret
       dynamoNamespace: sglang-disagg
       componentType: worker
-      replicas: 1
+      replicas: 1 # overridden by workflow if DECODE_REPLICAS provided
       resources:
         limits:
-          gpu: "1"
+          gpu: "${DECODE_GPUS}" # default 1
       extraPodSpec:
         mainContainer:
-          image: my-registry/sglang-runtime:my-tag
+          image: $MAIN_CONTAINER_IMAGE
           workingDir: /workspace/components/backends/sglang
           command:
             - /bin/sh
             - -c
           args:
-            - >-
-              python3 -m dynamo.sglang
-              --model-path Qwen/Qwen3-0.6B
-              --served-model-name Qwen/Qwen3-0.6B
-              --page-size 16
-              --tp 1
-              --trust-remote-code
-              --skip-tokenizer-init
-              --disaggregation-mode decode
-              --disaggregation-transfer-backend nixl
+            - "$DECODE_COMMAND"
 
     prefill:
       envFromSecret: hf-token-secret
       dynamoNamespace: sglang-disagg
       componentType: worker
-      replicas: 1
+      replicas: 1 # overridden by workflow if PREFILL_REPLICAS provided
       resources:
         limits:
-          gpu: "1"
+          gpu: "${PREFILL_GPUS}" # default 1
       extraPodSpec:
         mainContainer:
-          image: my-registry/sglang-runtime:my-tag
+          image: $MAIN_CONTAINER_IMAGE
           workingDir: /workspace/components/backends/sglang
           command:
             - /bin/sh
             - -c
           args:
-            - >-
-              python3 -m dynamo.sglang
-              --model-path Qwen/Qwen3-0.6B
-              --served-model-name Qwen/Qwen3-0.6B
-              --page-size 16
-              --tp 1
-              --trust-remote-code
-              --skip-tokenizer-init
-              --disaggregation-mode prefill
-              --disaggregation-transfer-backend nixl
+            - "$PREFILL_COMMAND"

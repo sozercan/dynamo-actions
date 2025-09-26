@@ -10,32 +10,25 @@ spec:
     Frontend:
       dynamoNamespace: sglang-agg
       componentType: frontend
-      replicas: 1
+      replicas: 1 # overridden by workflow if FRONTEND_REPLICAS provided
       extraPodSpec:
         mainContainer:
-          image: my-registry/sglang-runtime:my-tag
+          image: $MAIN_CONTAINER_IMAGE # default my-registry/sglang-runtime:my-tag
     decode:
       envFromSecret: hf-token-secret
       dynamoNamespace: sglang-agg
       componentType: worker
-      replicas: 1
+      replicas: 1 # overridden by workflow if DECODE_REPLICAS provided
       resources:
         limits:
-          gpu: "1"
+          gpu: "${DECODE_GPUS}" # default 1 GPUs per decode worker
       extraPodSpec:
         mainContainer:
-          image: my-registry/sglang-runtime:my-tag
+          image: $MAIN_CONTAINER_IMAGE # default my-registry/sglang-runtime:my-tag
           workingDir: /workspace/components/backends/sglang
           command:
             - /bin/sh
             - -c
           args:
-            - >-
-              python3 -m dynamo.sglang
-              --model-path Qwen/Qwen3-0.6B
-              --served-model-name Qwen/Qwen3-0.6B
-              --page-size 16
-              --tp 1
-              --trust-remote-code
-              --skip-tokenizer-init
+            - "$DECODE_COMMAND" # constructed by workflow (includes model $MODEL, page size ${PAGE_SIZE}, parallel flags)
 

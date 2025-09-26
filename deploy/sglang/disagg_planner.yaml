@@ -15,15 +15,15 @@ spec:
     Frontend:
       dynamoNamespace: dynamo
       componentType: frontend
-      replicas: 1
+      replicas: 1 # overridden by workflow if FRONTEND_REPLICAS provided
       extraPodSpec:
         mainContainer:
-          image: my-registry/sglang-runtime:my-tag
+          image: $MAIN_CONTAINER_IMAGE
     Planner:
       dynamoNamespace: dynamo
       envFromSecret: hf-token-secret
       componentType: planner
-      replicas: 1
+      replicas: 1 # overridden by workflow if PLANNER_REPLICAS provided
       livenessProbe:
         exec:
           command:
@@ -49,22 +49,17 @@ spec:
         mountPoint: /data
       extraPodSpec:
         mainContainer:
-          image: my-registry/sglang-runtime:my-tag
+          image: $MAIN_CONTAINER_IMAGE
           workingDir: /workspace/components/planner/src/dynamo/planner
           command:
             - /bin/sh
             - -c
           args:
-            - >-
-              python3 -m planner_sla
-              --environment=kubernetes
-              --backend=sglang
-              --adjustment-interval=60
-              --profile-results-dir=/data/profiling_results
-    Prometheus: # NOTE: this is set on Prometheus to ensure a service is created for the Prometheus component. This is a workaround and should be managed differently.
+            - "$PLANNER_COMMAND"
+    Prometheus: # NOTE: ensures service creation for Prometheus component.
       dynamoNamespace: dynamo
       componentType: frontend
-      replicas: 1
+      replicas: 1 # overridden by workflow if PROMETHEUS_REPLICAS provided
       envs:
         - name: PYTHONPATH
           value: "/workspace/components/planner/src"
@@ -89,72 +84,44 @@ spec:
         failureThreshold: 10
       extraPodSpec:
         mainContainer:
-          image: my-registry/sglang-runtime:my-tag
+          image: $MAIN_CONTAINER_IMAGE
           workingDir: /workspace/components/backends/sglang
           command:
             - /bin/sh
             - -c
           args:
-            - "python3 -m dynamo.planner.prometheus"
+            - "$PROMETHEUS_COMMAND"
     decode:
       dynamoNamespace: dynamo
       envFromSecret: hf-token-secret
       componentType: worker
-      replicas: 2
+      replicas: 2 # overridden by workflow if DECODE_REPLICAS provided
       resources:
         limits:
-          gpu: "1"
+          gpu: "${DECODE_GPUS}" # default 1
       extraPodSpec:
         mainContainer:
-          image: my-registry/sglang-runtime:my-tag
+          image: $MAIN_CONTAINER_IMAGE
           workingDir: /workspace/components/backends/sglang
           command:
-            - python3
+            - /bin/sh
+            - -c
           args:
-            - -m
-            - dynamo.sglang
-            - --model-path
-            - Qwen/Qwen3-0.6B
-            - --served-model-name
-            - Qwen/Qwen3-0.6B
-            - --page-size
-            - "16"
-            - --tp
-            - "1"
-            - --trust-remote-code
-            - --skip-tokenizer-init
-            - --disaggregation-mode
-            - decode
-            - --disaggregation-transfer-backend
-            - nixl
+            - "$DECODE_COMMAND"
     prefill:
       dynamoNamespace: dynamo
       envFromSecret: hf-token-secret
       componentType: worker
-      replicas: 2
+      replicas: 2 # overridden by workflow if PREFILL_REPLICAS provided
       resources:
         limits:
-          gpu: "1"
+          gpu: "${PREFILL_GPUS}" # default 1
       extraPodSpec:
         mainContainer:
-          image: my-registry/sglang-runtime:my-tag
+          image: $MAIN_CONTAINER_IMAGE
           workingDir: /workspace/components/backends/sglang
           command:
-            - python3
+            - /bin/sh
+            - -c
           args:
-            - -m
-            - dynamo.sglang
-            - --model-path
-            - Qwen/Qwen3-0.6B
-            - --served-model-name
-            - Qwen/Qwen3-0.6B
-            - --page-size
-            - "16"
-            - --tp
-            - "1"
-            - --trust-remote-code
-            - --skip-tokenizer-init
-            - --disaggregation-mode
-            - prefill
-            - --disaggregation-transfer-backend
-            - nixl
+            - "$PREFILL_COMMAND"
