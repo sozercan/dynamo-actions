@@ -323,6 +323,71 @@ jobs:
           set -euo pipefail
           kubectl get -f "${{ steps.render.outputs.manifest_path }}" -o name -n ${NAMESPACE}
 
+      - name: Smoke test frontend API
+        env:
+          MODEL_NAME: ${{ github.event.inputs.model_name }}
+        run: |
+          set -euo pipefail
+
+          echo "Locating frontend service via label selector..."
+          FRONTEND_SVC=$(kubectl get svc -n ${NAMESPACE} -l 'nvidia.com/dynamo-component-type=frontend' -o jsonpath='{.items[0].metadata.name}') || true
+          if [ -z "${FRONTEND_SVC}" ]; then
+            echo "::error::No service found with label nvidia.com/dynamo-component-type=frontend in namespace ${NAMESPACE}" >&2
+            kubectl get svc -n ${NAMESPACE} -l 'nvidia.com/dynamo-component-type=frontend' || true
+            exit 1
+          fi
+          echo "Found service: ${FRONTEND_SVC}"
+
+          echo "Waiting for frontend pods to become Ready..."
+          # Wait for at least one ready pod (timeout 5m)
+          if ! kubectl wait --for=condition=Ready pod -l nvidia.com/dynamo-component-type=frontend -n ${NAMESPACE} --timeout=300s; then
+            echo "::error::Frontend pods did not become ready in time" >&2
+            kubectl get pods -n ${NAMESPACE} -l nvidia.com/dynamo-component-type=frontend -o wide || true
+            exit 1
+          fi
+
+          # Start port-forward in background
+          echo "Starting port-forward to ${FRONTEND_SVC}..."
+          kubectl port-forward svc/${FRONTEND_SVC} 8000:8000 -n ${NAMESPACE} >/tmp/port-forward.log 2>&1 &
+          PF_PID=$!
+          echo "Port-forward PID: $PF_PID"
+          # Ensure cleanup
+          trap 'echo "Stopping port-forward"; kill $PF_PID 2>/dev/null || true' EXIT
+
+          # Wait for port-forward to establish
+          attempt=0
+          until curl -sf http://localhost:8000/v1/models >/dev/null 2>&1; do
+            attempt=$((attempt+1))
+            if [ $attempt -gt 30 ]; then
+              echo "::error::/v1/models endpoint not responding after $attempt attempts" >&2
+              echo "Port-forward logs:" >&2
+              sed -e 's/^/PF: /' /tmp/port-forward.log || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "Fetching model list..."
+          MODELS_JSON=$(curl -sSf http://localhost:8000/v1/models || true)
+          echo "Models response: ${MODELS_JSON}" | sed 's/^/API: /'
+
+          echo "Sending test chat completion request..."
+          # Build JSON payload (MODEL_NAME already an env var; avoid heredoc to keep YAML parser happy)
+          CHAT_REQ_EVAL=$(printf '{"model":"%s","messages":[{"role":"user","content":"Hello!"}],"max_tokens":20}' "${MODEL_NAME}")
+          CHAT_RESP_HTTP=$(mktemp)
+          HTTP_CODE=$(echo "$CHAT_REQ_EVAL" | curl -s -o "$CHAT_RESP_HTTP" -w '%{http_code}' -H 'Content-Type: application/json' http://localhost:8000/v1/chat/completions || true)
+
+          echo "HTTP status: $HTTP_CODE"
+            # Show response (truncate if huge)
+          echo "Response body:"; sed -e 's/^/API: /' "$CHAT_RESP_HTTP" | head -c 5000
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::error::Chat completion request failed (status $HTTP_CODE)" >&2
+            exit 1
+          fi
+
+          echo "Smoke test succeeded."
+
       - name: Upload manifest artifact
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
