@@ -3,15 +3,25 @@ name: deploy-model
 on:
   workflow_dispatch:
     inputs:
+      runtime:
+        description: "Model runtime (vllm | sglang)"
+        type: choice
+        options:
+          - vllm
+          - sglang
+        default: vllm
+        required: true
       deployment_type:
         description: "Template in deploy/ to render"
         type: choice
         options:
           - agg
           - agg_router
+          - agg_logging
           - disagg
           - disagg_router
           - disagg_planner
+          - disagg_multinode
         default: disagg
         required: true
       main_container_image:
@@ -47,11 +57,96 @@ on:
         type: number
         default: 1
         required: true
+      # SGLANG specific / advanced inputs (ignored for vllm unless later templates use them)
+      page_size:
+        description: "Token page size (sglang)"
+        type: number
+        default: 16
+        required: true
+      tp_size:
+        description: "Tensor parallel size (sglang)"
+        type: number
+        default: 1
+        required: true
+      dp_size:
+        description: "Data parallel size (sglang)"
+        type: number
+        default: 1
+        required: true
+      ep_size:
+        description: "Expert parallel size (sglang)"
+        type: number
+        default: 1
+        required: true
+      decode_gpus:
+        description: "Number of GPUs per decode worker (sglang)"
+        type: number
+        default: 1
+        required: true
+      prefill_gpus:
+        description: "Number of GPUs per prefill worker (sglang)"
+        type: number
+        default: 1
+        required: true
+      enable_dp_attention:
+        description: "Enable DP attention optimization (sglang)"
+        type: boolean
+        default: false
+        required: true
+      trust_remote_code:
+        description: "Pass --trust-remote-code (sglang)"
+        type: boolean
+        default: true
+        required: true
+      skip_tokenizer_init:
+        description: "Skip tokenizer init (sglang)"
+        type: boolean
+        default: true
+        required: true
+      disagg_transfer_backend:
+        description: "Disaggregation transfer backend (sglang)"
+        default: nixl
+        required: true
+      disagg_bootstrap_port:
+        description: "Disaggregation bootstrap port (sglang)"
+        type: number
+        default: 30001
+        required: true
+      mem_fraction_static:
+        description: "Static memory fraction (sglang, optional)"
+        default: ""
+        required: false
+      multinode_decode_node_count:
+        description: "Multinode nodeCount for decode (sglang multi-node)"
+        type: number
+        default: 1
+        required: true
+      multinode_prefill_node_count:
+        description: "Multinode nodeCount for prefill (sglang multi-node)"
+        type: number
+        default: 1
+        required: true
+      worker_command_extra:
+        description: "Extra flags appended to worker commands (sglang)"
+        default: ""
+        required: false
+      frontend_command_extra:
+        description: "Extra flags appended to frontend command (sglang)"
+        default: ""
+        required: false
+      planner_command_extra:
+        description: "Extra flags appended to planner command (sglang planner template)"
+        default: ""
+        required: false
+      prometheus_command_extra:
+        description: "Extra flags appended to prometheus command (sglang planner template)"
+        default: ""
+        required: false
 
 permissions: read-all
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.deployment_type || 'manual' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.runtime || 'vllm' }}-${{ github.event.inputs.deployment_type || 'manual' }}
   cancel-in-progress: true
 
 jobs:
@@ -62,9 +157,70 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      - name: Build sglang commands (if runtime=sglang)
+        id: build-sglang
+        env:
+          RUNTIME: ${{ github.event.inputs.runtime }}
+          DEPLOYMENT_TYPE: ${{ github.event.inputs.deployment_type }}
+          MODEL: ${{ github.event.inputs.model_name }}
+          PAGE_SIZE: ${{ github.event.inputs.page_size }}
+          TP_SIZE: ${{ github.event.inputs.tp_size }}
+          DP_SIZE: ${{ github.event.inputs.dp_size }}
+          EP_SIZE: ${{ github.event.inputs.ep_size }}
+          ENABLE_DP_ATTENTION: ${{ github.event.inputs.enable_dp_attention }}
+          TRUST_REMOTE_CODE: ${{ github.event.inputs.trust_remote_code }}
+          SKIP_TOKENIZER_INIT: ${{ github.event.inputs.skip_tokenizer_init }}
+          DISAGG_TRANSFER_BACKEND: ${{ github.event.inputs.disagg_transfer_backend }}
+          DISAGG_BOOTSTRAP_PORT: ${{ github.event.inputs.disagg_bootstrap_port }}
+          MEM_FRACTION_STATIC: ${{ github.event.inputs.mem_fraction_static }}
+          WORKER_COMMAND_EXTRA: ${{ github.event.inputs.worker_command_extra }}
+          FRONTEND_COMMAND_EXTRA: ${{ github.event.inputs.frontend_command_extra }}
+          PLANNER_COMMAND_EXTRA: ${{ github.event.inputs.planner_command_extra }}
+          PROMETHEUS_COMMAND_EXTRA: ${{ github.event.inputs.prometheus_command_extra }}
+        run: |
+          set -euo pipefail
+          if [ "$RUNTIME" != "sglang" ]; then
+            echo "runtime is $RUNTIME; skipping sglang command build";
+            exit 0
+          fi
+
+            # Base command
+          BASE="python3 -m dynamo.sglang --model-path $MODEL --served-model-name $MODEL --page-size ${PAGE_SIZE} --tp ${TP_SIZE}"
+          if [ "${DP_SIZE}" != "1" ]; then BASE+=" --dp ${DP_SIZE}"; fi
+          if [ "${EP_SIZE}" != "1" ]; then BASE+=" --ep-size ${EP_SIZE}"; fi
+          # Boolean flags
+          [ "${ENABLE_DP_ATTENTION}" = "true" ] && BASE+=" --enable-dp-attention"
+          [ "${TRUST_REMOTE_CODE}" = "true" ] && BASE+=" --trust-remote-code"
+            # Some users may want to disable skip-tokenizer-init, so only add when true
+          [ "${SKIP_TOKENIZER_INIT}" = "true" ] && BASE+=" --skip-tokenizer-init"
+          if [ -n "${MEM_FRACTION_STATIC}" ]; then BASE+=" --mem-fraction-static ${MEM_FRACTION_STATIC}"; fi
+
+          if [[ "$DEPLOYMENT_TYPE" == disagg* ]]; then
+            DECODE_ROLE_FLAGS="--disaggregation-mode decode --disaggregation-transfer-backend ${DISAGG_TRANSFER_BACKEND} --disaggregation-bootstrap-port ${DISAGG_BOOTSTRAP_PORT}"
+            PREFILL_ROLE_FLAGS="--disaggregation-mode prefill --disaggregation-transfer-backend ${DISAGG_TRANSFER_BACKEND} --disaggregation-bootstrap-port ${DISAGG_BOOTSTRAP_PORT}"
+          else
+            DECODE_ROLE_FLAGS=""
+            PREFILL_ROLE_FLAGS=""
+          fi
+
+          FRONTEND_COMMAND="exec ${BASE} ${FRONTEND_COMMAND_EXTRA}";
+          DECODE_COMMAND="exec ${BASE} ${DECODE_ROLE_FLAGS} ${WORKER_COMMAND_EXTRA}";
+          PREFILL_COMMAND="exec ${BASE} ${PREFILL_ROLE_FLAGS} ${WORKER_COMMAND_EXTRA}";
+          PLANNER_COMMAND="exec python3 -m planner_sla --environment=kubernetes --backend=sglang --adjustment-interval=60 --profile-results-dir=/data/profiling_results ${PLANNER_COMMAND_EXTRA}";
+          PROMETHEUS_COMMAND="python3 -m dynamo.planner.prometheus ${PROMETHEUS_COMMAND_EXTRA}";
+
+          {
+            echo "FRONTEND_COMMAND=${FRONTEND_COMMAND}";
+            echo "DECODE_COMMAND=${DECODE_COMMAND}";
+            echo "PREFILL_COMMAND=${PREFILL_COMMAND}";
+            echo "PLANNER_COMMAND=${PLANNER_COMMAND}";
+            echo "PROMETHEUS_COMMAND=${PROMETHEUS_COMMAND}";
+          } >> "$GITHUB_ENV"
+
       - name: Render manifest from template
         id: render
         env:
+          RUNTIME: ${{ github.event.inputs.runtime }}
           DEPLOYMENT_TYPE: ${{ github.event.inputs.deployment_type }}
           MAIN_CONTAINER_IMAGE: ${{ github.event.inputs.main_container_image }}
           MODEL: ${{ github.event.inputs.model_name }}
@@ -73,13 +229,34 @@ jobs:
           PREFILL_REPLICAS: ${{ github.event.inputs.prefill_replicas }}
           PLANNER_REPLICAS: ${{ github.event.inputs.planner_replicas }}
           PROMETHEUS_REPLICAS: ${{ github.event.inputs.prometheus_replicas }}
+          # sglang extras for envsubst (even if not used by vllm templates)
+          PAGE_SIZE: ${{ github.event.inputs.page_size }}
+          TP_SIZE: ${{ github.event.inputs.tp_size }}
+          DP_SIZE: ${{ github.event.inputs.dp_size }}
+          EP_SIZE: ${{ github.event.inputs.ep_size }}
+          DECODE_GPUS: ${{ github.event.inputs.decode_gpus }}
+          PREFILL_GPUS: ${{ github.event.inputs.prefill_gpus }}
+          ENABLE_DP_ATTENTION: ${{ github.event.inputs.enable_dp_attention }}
+          TRUST_REMOTE_CODE: ${{ github.event.inputs.trust_remote_code }}
+          SKIP_TOKENIZER_INIT: ${{ github.event.inputs.skip_tokenizer_init }}
+          DISAGG_TRANSFER_BACKEND: ${{ github.event.inputs.disagg_transfer_backend }}
+          DISAGG_BOOTSTRAP_PORT: ${{ github.event.inputs.disagg_bootstrap_port }}
+          MEM_FRACTION_STATIC: ${{ github.event.inputs.mem_fraction_static }}
+          MULTINODE_DECODE_NODE_COUNT: ${{ github.event.inputs.multinode_decode_node_count }}
+          MULTINODE_PREFILL_NODE_COUNT: ${{ github.event.inputs.multinode_prefill_node_count }}
+          FRONTEND_COMMAND: ${{ env.FRONTEND_COMMAND }}
+          DECODE_COMMAND: ${{ env.DECODE_COMMAND }}
+          PREFILL_COMMAND: ${{ env.PREFILL_COMMAND }}
+          PLANNER_COMMAND: ${{ env.PLANNER_COMMAND }}
+          PROMETHEUS_COMMAND: ${{ env.PROMETHEUS_COMMAND }}
         run: |
           set -euo pipefail
-          TEMPLATE="deploy/${DEPLOYMENT_TYPE}.yaml"
+          # Determine template path based on runtime
+          TEMPLATE="deploy/${RUNTIME}/${DEPLOYMENT_TYPE}.yaml"
           if [ ! -f "$TEMPLATE" ]; then
-            echo "Unsupported deployment type: ${DEPLOYMENT_TYPE}" >&2
-            echo "Available templates:"
-            ls deploy
+            echo "Unsupported deployment combination runtime=${RUNTIME} type=${DEPLOYMENT_TYPE}" >&2
+            echo "Available runtimes & templates:" >&2
+            find deploy -maxdepth 2 -name '*.yaml' >&2
             exit 1
           fi
 
@@ -103,11 +280,12 @@ jobs:
 
           path = Path(os.environ["MANIFEST"])
           lines = path.read_text(encoding="utf-8").splitlines()
-
           mapping = {
               "Frontend": "FRONTEND_REPLICAS",
               "VllmDecodeWorker": "DECODE_REPLICAS",
               "VllmPrefillWorker": "PREFILL_REPLICAS",
+              "decode": "DECODE_REPLICAS",
+              "prefill": "PREFILL_REPLICAS",
               "Planner": "PLANNER_REPLICAS",
               "Prometheus": "PROMETHEUS_REPLICAS",
           }
@@ -152,6 +330,11 @@ jobs:
         run: |
           set -euo pipefail
           kubectl apply -f "${{ steps.render.outputs.manifest_path }}"
+
+      - name: Validate deployment
+        run: |
+          set -euo pipefail
+          kubectl get -f "${{ steps.render.outputs.manifest_path }}" -o name
 
       - name: Upload manifest artifact
         if: always()

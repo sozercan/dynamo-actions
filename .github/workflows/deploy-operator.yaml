@@ -47,19 +47,35 @@ jobs:
       - name: Deploy Dynamo operator and platform
         shell: bash
         run: |
-          export NAMESPACE=dynamo-kubernetes
-          export RELEASE_VERSION=${DYNAMO_VERSION}
+          NAMESPACE=dynamo-kubernetes
+          RELEASE_VERSION="${DYNAMO_VERSION}"
+          echo "NAMESPACE=${NAMESPACE}" >> "$GITHUB_ENV"
+          export NAMESPACE RELEASE_VERSION
 
           helm fetch https://helm.ngc.nvidia.com/nvidia/ai-dynamo/charts/dynamo-crds-${RELEASE_VERSION}.tgz
           helm install dynamo-crds dynamo-crds-${RELEASE_VERSION}.tgz --namespace default
 
-          kubectl create namespace ${NAMESPACE}
+          kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
           helm fetch https://helm.ngc.nvidia.com/nvidia/ai-dynamo/charts/dynamo-platform-${RELEASE_VERSION}.tgz
           helm install dynamo-platform dynamo-platform-${RELEASE_VERSION}.tgz --namespace ${NAMESPACE}
       - name: Create HF token secret
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          NAMESPACE: ${{ env.NAMESPACE }}
         run: |
+          set -euo pipefail
+          if [ -z "${HF_TOKEN:-}" ]; then
+            echo "::warning::HF_TOKEN secret not provided; skipping secret creation"
+            exit 0
+          fi
           kubectl create secret generic hf-token-secret \
-            --from-literal=HF_TOKEN=${HF_TOKEN} \
-            -n ${NAMESPACE}
+            --from-literal=HF_TOKEN="$HF_TOKEN" \
+            -n ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Validate operator deployment
+        env:
+          NAMESPACE: ${{ env.NAMESPACE }}
+        run: |
+          set -euo pipefail
+          helm status dynamo-crds --namespace default
+          helm status dynamo-platform --namespace "${NAMESPACE}"
+          kubectl get pods --namespace "${NAMESPACE}"
