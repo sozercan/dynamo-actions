@@ -89,7 +89,7 @@ jobs:
         shell: bash
         run: |
           NAMESPACE=dynamo-kubernetes
-          RELEASE_VERSION="${DYNAMO_VERSION}"
+          RELEASE_VERSION="${RELEASE_VERSION:-${DYNAMO_VERSION#v}}"
           echo "NAMESPACE=${NAMESPACE}" >> "$GITHUB_ENV"
           export NAMESPACE RELEASE_VERSION
 
