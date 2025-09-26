@@ -346,6 +346,19 @@ jobs:
             exit 1
           fi
 
+          echo "Checking for worker pods..."
+          WORKER_COUNT=$(kubectl get pods -n ${NAMESPACE} -l nvidia.com/dynamo-component-type=worker --no-headers 2>/dev/null | wc -l | tr -d ' ' || true)
+          if [ "${WORKER_COUNT}" -gt 0 ]; then
+            echo "Waiting for ${WORKER_COUNT} worker pod(s) to become Ready..."
+            if ! kubectl wait --for=condition=Ready pod -l nvidia.com/dynamo-component-type=worker -n ${NAMESPACE} --timeout=600s; then
+              echo "::error::Worker pods did not become ready in time" >&2
+              kubectl get pods -n ${NAMESPACE} -l nvidia.com/dynamo-component-type=worker -o wide || true
+              exit 1
+            fi
+          else
+            echo "No worker pods detected (label nvidia.com/dynamo-component-type=worker) — skipping worker wait."
+          fi
+
           # Start port-forward in background
           echo "Starting port-forward to ${FRONTEND_SVC}..."
           kubectl port-forward svc/${FRONTEND_SVC} 8000:8000 -n ${NAMESPACE} >/tmp/port-forward.log 2>&1 &
